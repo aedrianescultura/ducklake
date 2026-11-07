@@ -53,10 +53,10 @@ SELECT count(*) FROM ducklake_table_insertions('ducklake', 's1.nope', 't', 3, 4)
 does not exist
 
 # flushing inlined data for a nested schema
-query III
+query IIII
 CALL ducklake_flush_inlined_data('ducklake', schema_name => 's1.child')
 ----
-s1.child	t	3
+s1.child	t	3	0
 
 query I
 SELECT count(*) FROM ducklake_list_files('ducklake', 't', schema => 's1.child')
@@ -114,10 +114,10 @@ CREATE SCHEMA ducklake."s1.child";
 statement ok
 CREATE TABLE ducklake."s1.child".literal_table AS SELECT 9 AS i;
 
-query III
+query IIII
 CALL ducklake_flush_inlined_data('ducklake', schema_name => '"s1.child"');
 ----
-"s1.child"	literal_table	1
+"s1.child"	literal_table	1	0
 
 query I
 SELECT count(*) FROM ducklake_list_files('ducklake', 'literal_table', schema => 's1.child');

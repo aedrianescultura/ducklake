@@ -73,7 +73,7 @@ SELECT count(*) FROM query_table(getvariable('flush_delete_table'))
 query II
 SELECT count(*), sum(rows_flushed) FROM ducklake_flush_inlined_data('lake')
 ----
-1	100
+2	100
 
 query I
 SELECT count(*) FROM query_table(getvariable('flush_delete_table'))

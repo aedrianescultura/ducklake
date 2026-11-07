@@ -24,8 +24,11 @@
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
+#include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/function/builtin_function_lookup.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -78,6 +81,7 @@ SourceResultType DuckLakeFlushData::GetDataInternal(ExecutionContext &context, D
 	chunk.data[0].Append(Value(latest_table.schema.GetSchemaName()));
 	chunk.data[1].Append(Value(latest_table.name));
 	chunk.data[2].Append(Value::BIGINT(static_cast<int64_t>(gstate.rows_flushed)));
+	chunk.data[3].Append(Value::BIGINT(0));
 	chunk.SetChildCardinality(1);
 	return SourceResultType::FINISHED;
 }
@@ -246,11 +250,11 @@ public:
 		return "ducklake";
 	}
 	vector<ColumnBinding> GetColumnBindings() override {
-		return GenerateColumnBindings(table_index, 3);
+		return GenerateColumnBindings(table_index, 4);
 	}
 
 	void ResolveTypes() override {
-		types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT};
+		types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
 	}
 };
 
@@ -355,8 +359,8 @@ struct FileDeleteInfo {
 	DeleteFileFormat existing_delete_format = DeleteFileFormat::PARQUET;
 };
 
-static void FlushInlinedFileDeletions(ClientContext &context, DuckLakeCatalog &catalog,
-                                      DuckLakeTransaction &transaction, DuckLakeTableEntry &table) {
+static idx_t FlushInlinedFileDeletions(ClientContext &context, DuckLakeCatalog &catalog,
+                                       DuckLakeTransaction &transaction, DuckLakeTableEntry &table) {
 	auto &metadata_manager = transaction.GetMetadataManager();
 	auto table_id = table.GetTableId();
 	auto snapshot = transaction.GetSnapshot();
@@ -365,7 +369,7 @@ static void FlushInlinedFileDeletions(ClientContext &context, DuckLakeCatalog &c
 	auto inlined_table_name = metadata_manager.GetInlinedDeletionTableName(table_id, snapshot);
 	if (inlined_table_name.empty()) {
 		// No inlined deletions for this table, skiddadle
-		return;
+		return 0;
 	}
 
 	// Query the inlined deletions with the delete file active when their data file was last visible
@@ -424,7 +428,11 @@ WHERE del.begin_snapshot <= {SNAPSHOT_ID}
 	}
 
 	if (files_to_flush.empty()) {
-		return;
+		return 0;
+	}
+	idx_t deletions_flushed = 0;
+	for (auto &entry : files_to_flush) {
+		deletions_flushed += entry.second.deletions.size();
 	}
 
 	// Write delete files
@@ -501,6 +509,22 @@ WHERE del.begin_snapshot <= {SNAPSHOT_ID}
 	// Register the delete files
 	transaction.AddDeletes(table_id, std::move(delete_files));
 	transaction.MarkInlinedFileDeletionsFlushed(table_id, snapshot.snapshot_id);
+	return deletions_flushed;
+}
+
+static unique_ptr<LogicalOperator> GenerateDeletionFlushResult(Binder &binder, const DuckLakeTableEntry &table,
+                                                               idx_t deletions_flushed) {
+	vector<LogicalType> types {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
+	vector<unique_ptr<Expression>> row;
+	row.push_back(make_uniq<BoundConstantExpression>(Value(table.schema.GetSchemaName())));
+	row.push_back(make_uniq<BoundConstantExpression>(Value(table.name)));
+	row.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(0)));
+	row.push_back(make_uniq<BoundConstantExpression>(Value::BIGINT(static_cast<int64_t>(deletions_flushed))));
+	vector<vector<unique_ptr<Expression>>> rows;
+	rows.push_back(std::move(row));
+	auto result = make_uniq<LogicalExpressionGet>(binder.GenerateTableIndex(), std::move(types), std::move(rows));
+	result->children.push_back(make_uniq<LogicalDummyScan>(binder.GenerateTableIndex()));
+	return std::move(result);
 }
 
 //===--------------------------------------------------------------------===//
@@ -525,22 +549,27 @@ static unique_ptr<LogicalOperator> FlushInlinedDataBind(ClientContext &context, 
 			                            inlined_table);
 			flushes.push_back(flusher.GenerateFlushCommand());
 		}
-		FlushInlinedFileDeletions(context, ducklake_catalog, transaction, table_entry);
+		auto deletions_flushed = FlushInlinedFileDeletions(context, ducklake_catalog, transaction, table_entry);
+		if (deletions_flushed > 0) {
+			flushes.push_back(GenerateDeletionFlushResult(*input.binder, table_entry, deletions_flushed));
+		}
 	}
 	return_names.push_back("schema_name");
 	return_names.push_back("table_name");
 	return_names.push_back("rows_flushed");
+	return_names.push_back("deletions_flushed");
 	if (flushes.empty()) {
 		// nothing to write - generate empty result
 		vector<LogicalType> return_types;
 		return_types.emplace_back(LogicalType::VARCHAR);
 		return_types.emplace_back(LogicalType::VARCHAR);
 		return_types.emplace_back(LogicalType::BIGINT);
+		return_types.emplace_back(LogicalType::BIGINT);
 		auto bindings = LogicalOperator::GenerateColumnBindings(bind_index, return_types.size());
 		return make_uniq<LogicalEmptyResult>(std::move(return_types), std::move(bindings));
 	}
 
-	auto child = input.binder->UnionOperators(std::move(flushes), 3);
+	auto child = input.binder->UnionOperators(std::move(flushes), 4);
 	if (child->type == LogicalOperatorType::LOGICAL_UNION) {
 		// the flushes are independent, so their pipelines may run concurrently
 		child->Cast<LogicalSetOperation>().allow_out_of_order = true;
@@ -551,12 +580,13 @@ static unique_ptr<LogicalOperator> FlushInlinedDataBind(ClientContext &context, 
 	//   SELECT
 	//     schema_name,
 	//     table_name,
-	//     SUM(rows_flushed) AS rows_flushed
+	//     SUM(rows_flushed) AS rows_flushed,
+	//     SUM(deletions_flushed) AS deletions_flushed
 	//   FROM (flush_1 UNION ALL flush_2 UNION ALL flush_3 UNION ALL ...) t
 	//   GROUP BY schema_name, table_name
-	//   HAVING rows_flushed > 0;
+	//   HAVING rows_flushed > 0 OR deletions_flushed > 0;
 
-	// Resolve columns are: [0] schema_name (VARCHAR), [1] table_name (VARCHAR), [2] rows_flushed (BIGINT)
+	// Resolve columns are: schema_name, table_name, rows_flushed, deletions_flushed
 	child->ResolveOperatorTypes();
 	auto child_bindings = child->GetColumnBindings();
 
@@ -571,6 +601,11 @@ static unique_ptr<LogicalOperator> FlushInlinedDataBind(ClientContext &context, 
 	auto sum_func = GetBuiltinAggregateFunction(context, "sum", {sum_args[0]->GetReturnType()});
 	FunctionBinder function_binder(context);
 	auto sum_aggregate = function_binder.BindAggregateFunction(std::move(sum_func), std::move(sum_args));
+	vector<unique_ptr<Expression>> deletion_sum_args;
+	deletion_sum_args.push_back(make_uniq<BoundColumnRefExpression>(child->types[3], child_bindings[3]));
+	auto deletion_sum_func = GetBuiltinAggregateFunction(context, "sum", {deletion_sum_args[0]->GetReturnType()});
+	auto deletion_sum_aggregate =
+	    function_binder.BindAggregateFunction(std::move(deletion_sum_func), std::move(deletion_sum_args));
 
 	// Create LogicalAggregate with GROUP BY schema_name, table_name and SUM(rows_flushed)
 	auto group_index = input.binder->GenerateTableIndex();
@@ -578,20 +613,27 @@ static unique_ptr<LogicalOperator> FlushInlinedDataBind(ClientContext &context, 
 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(sum_aggregate));
+	aggregates.push_back(std::move(deletion_sum_aggregate));
 
 	auto aggregate = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
 	aggregate->groups = std::move(groups);
 	aggregate->children.push_back(std::move(child));
-	// Resolved columns are: [0] schema_name (VARCHAR), [1] table_name (VARCHAR), [2] SUM(rows_flushed) (HUGEINT)
 	aggregate->ResolveOperatorTypes();
 
-	// Create HAVING filter (SUM(rows_flushed) > 0)
+	// Create HAVING filter (SUM(rows_flushed) > 0 OR SUM(deletions_flushed) > 0)
 	auto agg_bindings = aggregate->GetColumnBindings();
 	unique_ptr<Expression> sum_col_ref = make_uniq<BoundColumnRefExpression>(aggregate->types[2], agg_bindings[2]);
-	// Note: SUM(BIGINT) returns HUGEINT. We must use the its output type for the 0 constant
 	unique_ptr<Expression> zero_const = make_uniq<BoundConstantExpression>(Value::Numeric(aggregate->types[2], 0));
-	unique_ptr<Expression> filter_expr = BoundComparisonExpression::Create(
-	    ExpressionType::COMPARE_GREATERTHAN, std::move(sum_col_ref), std::move(zero_const));
+	auto rows_filter = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, std::move(sum_col_ref),
+	                                                     std::move(zero_const));
+	unique_ptr<Expression> deletion_sum_col_ref =
+	    make_uniq<BoundColumnRefExpression>(aggregate->types[3], agg_bindings[3]);
+	unique_ptr<Expression> deletion_zero_const =
+	    make_uniq<BoundConstantExpression>(Value::Numeric(aggregate->types[3], 0));
+	auto deletions_filter = BoundComparisonExpression::Create(
+	    ExpressionType::COMPARE_GREATERTHAN, std::move(deletion_sum_col_ref), std::move(deletion_zero_const));
+	auto filter_expr = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(rows_filter),
+	                                                         std::move(deletions_filter));
 
 	auto filter = make_uniq<LogicalFilter>(std::move(filter_expr));
 	filter->children.push_back(std::move(aggregate));

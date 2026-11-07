@@ -22,10 +22,10 @@ INSERT INTO lake.t VALUES (1), (2)
 statement ok
 ALTER TABLE lake.t RENAME TO t2
 
-query III
+query IIII
 CALL ducklake_flush_inlined_data('lake')
 ----
-main	t2	2
+main	t2	2	0
 
 # the old name is taken by a new table in the flushing transaction
 statement ok
@@ -46,10 +46,10 @@ BEGIN
 statement ok
 CREATE TABLE lake.v (j INTEGER)
 
-query III
+query IIII
 CALL ducklake_flush_inlined_data('lake')
 ----
-main	v2	3
+main	v2	3	0
 
 statement ok
 COMMIT
