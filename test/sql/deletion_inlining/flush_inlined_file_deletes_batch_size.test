@@ -1,0 +1,167 @@
+# name: test/sql/deletion_inlining/flush_inlined_file_deletes_batch_size.test
+# description: flush inlined deletions of multiple tables with batch sizes that split and combine tables
+# group: [deletion_inlining]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/flush_inlined_file_deletes_batch_size', DATA_INLINING_ROW_LIMIT 10, METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+USE ducklake
+
+statement ok
+SET threads = 4
+
+query I
+SELECT current_setting('ducklake_flush_inlined_deletes_batch_size')
+----
+1000000
+
+statement error
+SET ducklake_flush_inlined_deletes_batch_size = 0
+----
+must be at least 1
+
+statement error
+SET ducklake_flush_inlined_deletes_batch_size = NULL
+----
+must be at least 1
+
+# 5 tables with 3 data files of 20 rows each
+loop t 1 6
+
+statement ok
+CREATE TABLE t{t} (a INTEGER)
+
+loop i 0 3
+
+statement ok
+INSERT INTO t{t} SELECT range FROM range(20)
+
+endloop
+
+endloop
+
+# every round inlines 3 deletes per table (one per data file), flushes them with a different batch size, and checks
+# the batches that were written
+statement ok
+CALL enable_logging(level = 'debug', storage = 'memory')
+
+# batch size 1: every data file is its own batch
+statement ok
+SET ducklake_flush_inlined_deletes_batch_size = 1
+
+loop t 1 6
+
+statement ok
+DELETE FROM t{t} WHERE a = 19
+
+endloop
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake')
+
+query II
+SELECT message, count(*) FROM duckdb_logs WHERE message LIKE 'DuckLake flush batch:%' GROUP BY message ORDER BY message
+----
+DuckLake flush batch: tables=1, delete_files=1, inlined_deletes=1	15
+
+statement ok
+CALL truncate_duckdb_logs()
+
+# batch size 5: tables are split across batches, and a batch combines several tables
+statement ok
+SET ducklake_flush_inlined_deletes_batch_size = 5
+
+loop t 1 6
+
+statement ok
+DELETE FROM t{t} WHERE a = 18
+
+endloop
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake')
+
+query II
+SELECT message, count(*) FROM duckdb_logs WHERE message LIKE 'DuckLake flush batch:%' GROUP BY message ORDER BY message
+----
+DuckLake flush batch: tables=2, delete_files=5, inlined_deletes=5	2
+DuckLake flush batch: tables=3, delete_files=5, inlined_deletes=5	1
+
+statement ok
+CALL truncate_duckdb_logs()
+
+# batch size 2: the last data file of a table shares a batch with the first of the next table
+statement ok
+SET ducklake_flush_inlined_deletes_batch_size = 2
+
+loop t 1 6
+
+statement ok
+DELETE FROM t{t} WHERE a = 17
+
+endloop
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake')
+
+query II
+SELECT message, count(*) FROM duckdb_logs WHERE message LIKE 'DuckLake flush batch:%' GROUP BY message ORDER BY message
+----
+DuckLake flush batch: tables=1, delete_files=1, inlined_deletes=1	1
+DuckLake flush batch: tables=1, delete_files=2, inlined_deletes=2	5
+DuckLake flush batch: tables=2, delete_files=2, inlined_deletes=2	2
+
+statement ok
+CALL truncate_duckdb_logs()
+
+# default batch size (1M): all tables in one batch
+statement ok
+RESET ducklake_flush_inlined_deletes_batch_size
+
+loop t 1 6
+
+statement ok
+DELETE FROM t{t} WHERE a = 16
+
+endloop
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake')
+
+query II
+SELECT message, count(*) FROM duckdb_logs WHERE message LIKE 'DuckLake flush batch:%' GROUP BY message ORDER BY message
+----
+DuckLake flush batch: tables=5, delete_files=15, inlined_deletes=15	1
+
+statement ok
+CALL disable_logging()
+
+# no inlined deletes left, and 4 rounds of 3 deletes per table in one live delete file per data file
+query I
+SELECT (SELECT count(*) FROM ducklake_meta.ducklake_inlined_delete_1) + (SELECT count(*) FROM ducklake_meta.ducklake_inlined_delete_2) + (SELECT count(*) FROM ducklake_meta.ducklake_inlined_delete_3) + (SELECT count(*) FROM ducklake_meta.ducklake_inlined_delete_4) + (SELECT count(*) FROM ducklake_meta.ducklake_inlined_delete_5)
+----
+0
+
+query III
+SELECT count(DISTINCT table_id), count(*), sum(delete_count) FROM ducklake_meta.ducklake_delete_file WHERE end_snapshot IS NULL
+----
+5	15	60
+
+query IIIII
+SELECT (SELECT count(*) FROM t1), (SELECT count(*) FROM t2), (SELECT count(*) FROM t3), (SELECT count(*) FROM t4), (SELECT count(*) FROM t5)
+----
+48	48	48	48	48
+
+query I
+SELECT DISTINCT max(a) FROM (FROM t1 UNION ALL FROM t2 UNION ALL FROM t3 UNION ALL FROM t4 UNION ALL FROM t5)
+----
+15
