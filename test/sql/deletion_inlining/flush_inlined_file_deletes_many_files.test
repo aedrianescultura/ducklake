@@ -1,0 +1,110 @@
+# name: test/sql/deletion_inlining/flush_inlined_file_deletes_many_files.test
+# description: flush inlined deletions of many data files across multiple tables, in batches that split tables
+# group: [deletion_inlining]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/flush_inlined_file_deletes_many_files', DATA_INLINING_ROW_LIMIT 10, METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+USE ducklake
+
+# the delete files are written by parallel tasks
+statement ok
+SET threads = 4
+
+statement ok
+CREATE TABLE t1 (file_no INTEGER, a INTEGER)
+
+statement ok
+CREATE TABLE t2 (file_no INTEGER, a INTEGER)
+
+# 20 data files per table
+loop i 0 20
+
+statement ok
+INSERT INTO t1 SELECT {i}, range FROM range(20)
+
+statement ok
+INSERT INTO t2 SELECT {i}, range FROM range(20)
+
+endloop
+
+# 12 deletes per file exceed the inlining limit: half of t1's files get a delete file
+statement ok
+DELETE FROM t1 WHERE file_no < 10 AND a < 12
+
+# inlined deletes on every data file of both tables, over two snapshots
+statement ok
+DELETE FROM t1 WHERE a = 15
+
+statement ok
+DELETE FROM t2 WHERE a = 15
+
+statement ok
+DELETE FROM t1 WHERE a = 16
+
+statement ok
+DELETE FROM t2 WHERE a = 16
+
+query II
+SELECT count(*), sum(a) FROM t1
+----
+240	2520
+
+query II
+SELECT count(*), sum(a) FROM t2
+----
+360	3180
+
+# every data file has 2 inlined deletes: batches of 4 data files split both tables
+statement ok
+SET ducklake_flush_inlined_deletes_batch_size = 7
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake')
+
+query II
+SELECT count(*), sum(a) FROM t1
+----
+240	2520
+
+query II
+SELECT count(*), sum(a) FROM t2
+----
+360	3180
+
+# one delete file per data file, holding both the existing and the flushed deletions
+query III
+SELECT table_id, count(*), sum(delete_count) FROM ducklake_meta.ducklake_delete_file WHERE end_snapshot IS NULL GROUP BY table_id ORDER BY table_id
+----
+1	20	160
+2	20	40
+
+query I
+SELECT count(*) FROM ducklake_meta.ducklake_inlined_delete_1
+----
+0
+
+query I
+SELECT count(*) FROM ducklake_meta.ducklake_inlined_delete_2
+----
+0
+
+# time travel to before the second round of inlined deletions
+query II
+SELECT count(*), sum(a) FROM t1 AT (VERSION => 45)
+----
+260	2840
+
+query II
+SELECT count(*), sum(a) FROM t2 AT (VERSION => 45)
+----
+380	3500

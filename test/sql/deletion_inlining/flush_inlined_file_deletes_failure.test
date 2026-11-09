@@ -1,0 +1,63 @@
+# name: test/sql/deletion_inlining/flush_inlined_file_deletes_failure.test
+# description: a delete file that fails to write leaves no delete files of the other data files behind
+# group: [deletion_inlining]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{DATA_PATH}/flush_inlined_file_deletes_failure', DATA_INLINING_ROW_LIMIT 10, METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+USE ducklake
+
+statement ok
+SET threads = 4
+
+statement ok
+CREATE TABLE t (file_no INTEGER, a INTEGER)
+
+loop i 0 20
+
+statement ok
+INSERT INTO t SELECT {i}, range FROM range(20)
+
+endloop
+
+# 12 deletes exceed the inlining limit, so the last data file gets a delete file
+statement ok
+DELETE FROM t WHERE file_no = 19 AND a < 12
+
+# an inlined delete on every data file
+statement ok
+DELETE FROM t WHERE a = 15
+
+query I
+SELECT count(*) FROM glob('{DATA_PATH}/flush_inlined_file_deletes_failure/**/*')
+----
+21
+
+# the last data file's delete file can no longer be read, so its task fails after the others wrote theirs
+statement ok
+UPDATE ducklake_meta.ducklake_delete_file SET path = 'missing-delete.parquet'
+
+statement error
+CALL ducklake_flush_inlined_data('ducklake')
+----
+missing-delete.parquet
+
+# 20 data files and 1 delete file: the delete files the other tasks wrote were removed with the rollback
+query I
+SELECT count(*) FROM glob('{DATA_PATH}/flush_inlined_file_deletes_failure/**/*')
+----
+21
+
+query I
+SELECT count(*) FROM ducklake_meta.ducklake_inlined_delete_1
+----
+20

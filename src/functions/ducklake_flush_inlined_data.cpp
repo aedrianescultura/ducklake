@@ -5,6 +5,8 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "storage/ducklake_transaction.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_schema_entry.hpp"
@@ -342,6 +344,7 @@ unique_ptr<LogicalOperator> DuckLakeDataFlusher::GenerateFlushCommand() {
 //===--------------------------------------------------------------------===//
 
 struct FileDeleteInfo {
+	DataFileIndex file_id;
 	string file_path;
 	set<PositionWithSnapshot> deletions;
 	idx_t max_snapshot = 0;
@@ -353,20 +356,59 @@ struct FileDeleteInfo {
 	idx_t existing_delete_begin_snapshot = 0;
 	string existing_delete_encryption_key;
 	DeleteFileFormat existing_delete_format = DeleteFileFormat::PARQUET;
+
+	// Delete file written earlier in this transaction (if any)
+	bool has_local_delete_file = false;
+	DuckLakeDeleteFile local_delete_file;
 };
 
-static void FlushInlinedFileDeletions(ClientContext &context, DuckLakeCatalog &catalog,
-                                      DuckLakeTransaction &transaction, DuckLakeTableEntry &table) {
+//! The inlined file deletions of a range of a table's data files, and the delete files that replace them
+struct TableFileDeletionsFlush {
+	explicit TableFileDeletionsFlush(DuckLakeTableEntry &table) : table(table) {
+	}
+
+	DuckLakeTableEntry &table;
+	idx_t flush_snapshot_id = 0;
+	idx_t inlined_delete_count = 0;
+	string encryption_key;
+	bool use_deletion_vectors = false;
+	vector<FileDeleteInfo> files;
+	vector<DuckLakeDeleteFile> delete_files;
+};
+
+//! The number of inlined deletions per data file of a table, ordered by data file
+static vector<pair<idx_t, idx_t>> CountInlinedFileDeletions(DuckLakeTransaction &transaction, DuckLakeTableEntry &table,
+                                                            Identifier &inlined_table_name) {
+	vector<pair<idx_t, idx_t>> counts;
+	auto &metadata_manager = transaction.GetMetadataManager();
+	auto snapshot = transaction.GetSnapshot();
+	inlined_table_name = metadata_manager.GetInlinedDeletionTableName(table.GetTableId(), snapshot);
+	if (inlined_table_name.empty()) {
+		return counts;
+	}
+	auto result = metadata_manager.Query(snapshot, StringUtil::Format(R"(
+SELECT file_id, COUNT(*)
+FROM {METADATA_CATALOG}.%s
+WHERE begin_snapshot <= {SNAPSHOT_ID}
+GROUP BY file_id
+ORDER BY file_id
+	)",
+	                                                                  inlined_table_name));
+	result->ThrowIfError("Failed to count inlined file deletions for flush: ");
+	for (auto &row : *result) {
+		counts.emplace_back(row.GetValue<idx_t>(0), row.GetValue<idx_t>(1));
+	}
+	return counts;
+}
+
+static unique_ptr<TableFileDeletionsFlush> CollectInlinedFileDeletions(ClientContext &context, DuckLakeCatalog &catalog,
+                                                                       DuckLakeTransaction &transaction,
+                                                                       DuckLakeTableEntry &table,
+                                                                       const Identifier &inlined_table_name,
+                                                                       idx_t min_file_id, idx_t max_file_id) {
 	auto &metadata_manager = transaction.GetMetadataManager();
 	auto table_id = table.GetTableId();
 	auto snapshot = transaction.GetSnapshot();
-
-	// Check if this table has an inlined deletion table
-	auto inlined_table_name = metadata_manager.GetInlinedDeletionTableName(table_id, snapshot);
-	if (inlined_table_name.empty()) {
-		// No inlined deletions for this table, skiddadle
-		return;
-	}
 
 	// Query the inlined deletions with the delete file active when their data file was last visible
 	auto deletions_result = metadata_manager.Query(snapshot, StringUtil::Format(R"(
@@ -381,12 +423,13 @@ LEFT JOIN {METADATA_CATALOG}.ducklake_delete_file existing_del
        AND {SNAPSHOT_ID} >= existing_del.begin_snapshot
        AND (existing_del.end_snapshot IS NULL
             OR existing_del.end_snapshot >= COALESCE(data.end_snapshot, {SNAPSHOT_ID} + 1))
-WHERE del.begin_snapshot <= {SNAPSHOT_ID}
+WHERE del.begin_snapshot <= {SNAPSHOT_ID} AND del.file_id BETWEEN %d AND %d
 	)",
-	                                                                            inlined_table_name, table_id.index));
+	                                                                            inlined_table_name, table_id.index,
+	                                                                            min_file_id, max_file_id));
 	deletions_result->ThrowIfError("Failed to query inlined file deletions for flush: ");
 
-	unordered_map<idx_t, FileDeleteInfo> files_to_flush;
+	map<idx_t, FileDeleteInfo> files_to_flush;
 	auto &separator = catalog.Separator();
 	for (auto &row : *deletions_result) {
 		auto file_id = row.GetValue<idx_t>(0);
@@ -424,83 +467,153 @@ WHERE del.begin_snapshot <= {SNAPSHOT_ID}
 	}
 
 	if (files_to_flush.empty()) {
-		return;
+		return nullptr;
 	}
 
-	// Write delete files
-	auto &fs = FileSystem::GetFileSystem(context);
-	vector<DuckLakeDeleteFile> delete_files;
-
-	// Get encryption key if the catalog is encrypted
-	string encryption_key;
+	auto result = make_uniq<TableFileDeletionsFlush>(table);
+	result->flush_snapshot_id = snapshot.snapshot_id;
 	if (catalog.IsEncrypted()) {
-		encryption_key = catalog.GenerateEncryptionKey(context);
+		result->encryption_key = catalog.GenerateEncryptionKey(context);
 	}
-
-	bool use_deletion_vectors = catalog.WriteDeletionVectors(table);
+	result->use_deletion_vectors = catalog.WriteDeletionVectors(table);
 	for (auto &entry : files_to_flush) {
-		auto file_id = entry.first;
 		auto &file_info = entry.second;
-		set<PositionWithSnapshot> merged_deletions;
-		bool overwrites_existing = false;
-
-		if (file_info.has_existing_delete_file) {
-			overwrites_existing = true;
-
-			// Copy deletions for merging
-			merged_deletions = file_info.deletions;
-
-			// Read existing deletions from the delete file
-			DuckLakeFileData existing_delete_file_data;
-			existing_delete_file_data.path = file_info.existing_delete_path;
-			existing_delete_file_data.encryption_key = file_info.existing_delete_encryption_key;
-			existing_delete_file_data.format = file_info.existing_delete_format;
-
-			auto existing_deletions = DuckLakeDeleteFilter::ScanDeleteFile(context, existing_delete_file_data);
-
-			// Merge existing deletions with new inlined deletions
-			MergeDeletesWithSnapshots(existing_deletions, file_info.existing_delete_begin_snapshot, merged_deletions);
-
-			file_info.max_snapshot = MaxValue(file_info.max_snapshot, MaxSnapshotId(merged_deletions));
-		}
-
-		auto source = DeleteFileSource::FLUSH;
+		file_info.file_id = DataFileIndex(entry.first);
+		result->inlined_delete_count += file_info.deletions.size();
 		DuckLakeDeleteFile local_delete;
 		if (transaction.GetLocalDeleteFile(table_id, file_info.file_path, local_delete) &&
 		    local_delete.source == DeleteFileSource::REGULAR) {
-			if (merged_deletions.empty()) {
-				merged_deletions = file_info.deletions;
-			}
-			auto local_deletions =
-			    DuckLakeDeleteFilter::ScanDeleteFile(context, DuckLakeMultiFileList::GetDeleteData(local_delete));
-			// new deletes are dated to the expected commit snapshot
-			MergeDeletesWithSnapshots(local_deletions, snapshot.snapshot_id + 1, merged_deletions);
-			file_info.max_snapshot = MaxValue(file_info.max_snapshot, MaxSnapshotId(merged_deletions));
-			source = DeleteFileSource::REGULAR;
+			file_info.has_local_delete_file = true;
+			file_info.local_delete_file = std::move(local_delete);
 		}
+		result->files.push_back(std::move(file_info));
+	}
+	result->delete_files.resize(result->files.size());
+	return result;
+}
 
-		// Use reference to either merged or original deletions
-		const auto &deletions_to_write = merged_deletions.empty() ? file_info.deletions : merged_deletions;
+//! Merges the inlined deletions of a data file with its existing delete files and writes a new delete file
+static DuckLakeDeleteFile WriteFlushedDeleteFile(ClientContext &context, DuckLakeTransaction &transaction,
+                                                 const TableFileDeletionsFlush &flush, FileDeleteInfo &file_info) {
+	set<PositionWithSnapshot> merged_deletions;
+	bool overwrites_existing = false;
 
-		WriteDeleteFileWithSnapshotsInput file_input {
-		    context, transaction, fs, table.DataPath(), encryption_key, file_info.file_path, deletions_to_write,
-		    source};
-		auto delete_file = DuckLakeDeleteFileWriter::Write(context, file_input, use_deletion_vectors);
-		delete_file.data_file_id = DataFileIndex(file_id);
-		delete_file.max_snapshot = file_info.max_snapshot;
+	if (file_info.has_existing_delete_file) {
+		overwrites_existing = true;
 
-		if (overwrites_existing) {
-			delete_file.overwrites_existing_delete = true;
-			delete_file.overwritten_delete_file.delete_file_id = file_info.existing_delete_file_id;
-			delete_file.overwritten_delete_file.path = file_info.existing_delete_path;
-		}
+		// Copy deletions for merging
+		merged_deletions = file_info.deletions;
 
-		delete_files.push_back(std::move(delete_file));
+		// Read existing deletions from the delete file
+		DuckLakeFileData existing_delete_file_data;
+		existing_delete_file_data.path = file_info.existing_delete_path;
+		existing_delete_file_data.encryption_key = file_info.existing_delete_encryption_key;
+		existing_delete_file_data.format = file_info.existing_delete_format;
+
+		auto existing_deletions = DuckLakeDeleteFilter::ScanDeleteFile(context, existing_delete_file_data);
+
+		// Merge existing deletions with new inlined deletions
+		MergeDeletesWithSnapshots(existing_deletions, file_info.existing_delete_begin_snapshot, merged_deletions);
+
+		file_info.max_snapshot = MaxValue(file_info.max_snapshot, MaxSnapshotId(merged_deletions));
 	}
 
-	// Register the delete files
-	transaction.AddDeletes(table_id, std::move(delete_files));
-	transaction.MarkInlinedFileDeletionsFlushed(table_id, snapshot.snapshot_id);
+	auto source = DeleteFileSource::FLUSH;
+	if (file_info.has_local_delete_file) {
+		if (merged_deletions.empty()) {
+			merged_deletions = file_info.deletions;
+		}
+		auto local_deletions = DuckLakeDeleteFilter::ScanDeleteFile(
+		    context, DuckLakeMultiFileList::GetDeleteData(file_info.local_delete_file));
+		// new deletes are dated to the expected commit snapshot
+		MergeDeletesWithSnapshots(local_deletions, flush.flush_snapshot_id + 1, merged_deletions);
+		file_info.max_snapshot = MaxValue(file_info.max_snapshot, MaxSnapshotId(merged_deletions));
+		source = DeleteFileSource::REGULAR;
+	}
+
+	// Use reference to either merged or original deletions
+	const auto &deletions_to_write = merged_deletions.empty() ? file_info.deletions : merged_deletions;
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	WriteDeleteFileWithSnapshotsInput file_input {
+	    context, transaction, fs, flush.table.DataPath(), flush.encryption_key, file_info.file_path, deletions_to_write,
+	    source};
+	auto delete_file = DuckLakeDeleteFileWriter::Write(context, file_input, flush.use_deletion_vectors);
+	delete_file.data_file_id = file_info.file_id;
+	delete_file.max_snapshot = file_info.max_snapshot;
+
+	if (overwrites_existing) {
+		delete_file.overwrites_existing_delete = true;
+		delete_file.overwritten_delete_file.delete_file_id = file_info.existing_delete_file_id;
+		delete_file.overwritten_delete_file.path = file_info.existing_delete_path;
+	}
+	return delete_file;
+}
+
+class FlushFileDeletionsTask : public BaseExecutorTask {
+public:
+	FlushFileDeletionsTask(TaskExecutor &executor, ClientContext &context, DuckLakeTransaction &transaction,
+	                       TableFileDeletionsFlush &flush, idx_t file_idx)
+	    : BaseExecutorTask(executor), context(context), transaction(transaction), flush(flush), file_idx(file_idx) {
+	}
+
+	void ExecuteTask() override {
+		flush.delete_files[file_idx] = WriteFlushedDeleteFile(context, transaction, flush, flush.files[file_idx]);
+	}
+
+private:
+	ClientContext &context;
+	DuckLakeTransaction &transaction;
+	TableFileDeletionsFlush &flush;
+	idx_t file_idx;
+};
+
+static void FlushInlinedFileDeletions(ClientContext &context, DuckLakeTransaction &transaction,
+                                      vector<unique_ptr<TableFileDeletionsFlush>> &flushes) {
+	if (flushes.empty()) {
+		return;
+	}
+	idx_t file_count = 0;
+	idx_t delete_count = 0;
+	for (auto &flush : flushes) {
+		file_count += flush->files.size();
+		delete_count += flush->inlined_delete_count;
+	}
+	DUCKDB_LOG_DEBUG(context, StringUtil::Format("DuckLake flush batch: tables=%d, delete_files=%d, inlined_deletes=%d",
+	                                             flushes.size(), file_count, delete_count));
+
+	// every data file gets its own delete file, so they are written in parallel across all tables
+	// the tasks mostly wait on file I/O, so they run on the async pool rather than the threads queries execute on
+	TaskExecutor executor(context, TaskSchedulerType::ASYNC);
+	for (auto &flush : flushes) {
+		for (idx_t file_idx = 0; file_idx < flush->files.size(); file_idx++) {
+			executor.ScheduleTask(make_uniq<FlushFileDeletionsTask>(executor, context, transaction, *flush, file_idx));
+		}
+	}
+	try {
+		executor.WorkOnTasks();
+	} catch (std::exception &) {
+		// register the delete files the other tasks did write, so the rollback removes them
+		try {
+			for (auto &flush : flushes) {
+				vector<DuckLakeDeleteFile> written_files;
+				for (auto &delete_file : flush->delete_files) {
+					if (!delete_file.file_name.empty()) {
+						written_files.push_back(std::move(delete_file));
+					}
+				}
+				transaction.AddDeletes(flush->table.GetTableId(), std::move(written_files));
+			}
+		} catch (std::exception &) { // NOLINT: keep the original error
+		}
+		throw;
+	}
+
+	for (auto &flush : flushes) {
+		transaction.AddDeletes(flush->table.GetTableId(), std::move(flush->delete_files));
+	}
+	// release the loaded inlined deletes before the next batch is collected
+	flushes.clear();
 }
 
 //===--------------------------------------------------------------------===//
@@ -515,6 +628,13 @@ static unique_ptr<LogicalOperator> FlushInlinedDataBind(ClientContext &context, 
 	auto schema = DuckLakeTableFunctionUtil::GetStringOption(input, "schema_name");
 	auto table = DuckLakeTableFunctionUtil::GetStringOption(input, "table_name");
 	vector<unique_ptr<LogicalOperator>> flushes;
+	// data files are collected until their inlined deletes reach the batch size, then written out together
+	idx_t deletes_batch_size = 1000000;
+	context.TryGetCurrentSetting("ducklake_flush_inlined_deletes_batch_size", deletes_batch_size);
+	vector<unique_ptr<TableFileDeletionsFlush>> deletion_flushes;
+	idx_t batch_delete_count = 0;
+	Identifier inlined_table_name;
+	vector<TableIndex> tables_with_deletions;
 	for (auto &table_ref : DuckLakeBaseMetadataFunction::GetTablesInScope(context, ducklake_catalog, schema, table)) {
 		auto &table_entry = table_ref.get();
 		if (!ducklake_catalog.AutoCompactEnabled(table_entry)) {
@@ -525,7 +645,35 @@ static unique_ptr<LogicalOperator> FlushInlinedDataBind(ClientContext &context, 
 			                            inlined_table);
 			flushes.push_back(flusher.GenerateFlushCommand());
 		}
-		FlushInlinedFileDeletions(context, ducklake_catalog, transaction, table_entry);
+		auto counts = CountInlinedFileDeletions(transaction, table_entry, inlined_table_name);
+		// a data file is never split, so a batch overshoots by at most one data file's deletes
+		idx_t start = 0;
+		while (start < counts.size()) {
+			idx_t end = start;
+			while (end < counts.size() && batch_delete_count < deletes_batch_size) {
+				batch_delete_count += counts[end].second;
+				end++;
+			}
+			auto deletion_flush =
+			    CollectInlinedFileDeletions(context, ducklake_catalog, transaction, table_entry, inlined_table_name,
+			                                counts[start].first, counts[end - 1].first);
+			if (deletion_flush) {
+				if (tables_with_deletions.empty() || tables_with_deletions.back() != table_entry.GetTableId()) {
+					tables_with_deletions.push_back(table_entry.GetTableId());
+				}
+				deletion_flushes.push_back(std::move(deletion_flush));
+			}
+			if (batch_delete_count >= deletes_batch_size) {
+				FlushInlinedFileDeletions(context, transaction, deletion_flushes);
+				batch_delete_count = 0;
+			}
+			start = end;
+		}
+	}
+	FlushInlinedFileDeletions(context, transaction, deletion_flushes);
+	// a table split over several batches is only marked once all of its delete files are written
+	for (auto &table_id : tables_with_deletions) {
+		transaction.MarkInlinedFileDeletionsFlushed(table_id, transaction.GetSnapshot().snapshot_id);
 	}
 	return_names.push_back("schema_name");
 	return_names.push_back("table_name");
