@@ -1,0 +1,55 @@
+# name: test/sql/deletion_inlining/flush_inlined_data_return_value.test
+# description: report flushed inlined data rows and file deletions separately
+# group: [deletion_inlining]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS lake (DATA_PATH '{DATA_PATH}/flush_inlined_data_return_value', DATA_INLINING_ROW_LIMIT 10)
+
+statement ok
+CREATE TABLE lake.t AS SELECT i FROM range(20) t(i)
+
+# Deletions of file-backed rows are reported without data rows.
+statement ok
+DELETE FROM lake.t WHERE i < 3
+
+query IIII
+SELECT schema_name, table_name, rows_flushed, deletions_flushed FROM ducklake_flush_inlined_data('lake')
+----
+main	t	0	3
+
+# A single flush can materialize both inlined data and file deletions.
+statement ok
+INSERT INTO lake.t VALUES (20), (21)
+
+statement ok
+DELETE FROM lake.t WHERE i = 3
+
+query IIII
+SELECT schema_name, table_name, rows_flushed, deletions_flushed FROM ducklake_flush_inlined_data('lake')
+----
+main	t	2	1
+
+# A deleted version of an inlined insert is still a data row, not an inlined file deletion.
+statement ok
+INSERT INTO lake.t VALUES (22), (23)
+
+statement ok
+DELETE FROM lake.t WHERE i = 22
+
+query IIII
+SELECT schema_name, table_name, rows_flushed, deletions_flushed FROM ducklake_flush_inlined_data('lake')
+----
+main	t	2	0
+
+query I
+SELECT count(*) FROM lake.t
+----
+19

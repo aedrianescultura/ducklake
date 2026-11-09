@@ -33,10 +33,10 @@ SELECT count(*) FROM ducklake."p.q".table_insertions('t', 2, 3)
 ----
 2
 
-query III
+query IIII
 CALL ducklake_flush_inlined_data('ducklake', schema_name => 'p.q')
 ----
-"p.q"	t	2
+"p.q"	t	2	0
 
 query I
 SELECT count(*) FROM ducklake_list_files('ducklake', 't', schema => 'p.q')
@@ -73,10 +73,10 @@ CREATE TABLE ducklake."q""s".t(i INTEGER);
 statement ok
 INSERT INTO ducklake."q""s".t VALUES (5);
 
-query III
+query IIII
 CALL ducklake_flush_inlined_data('ducklake', schema_name => 'q"s')
 ----
-"q""s"	t	1
+"q""s"	t	1	0
 
 # Snapshot display uses SQL identifier quoting for literal names.
 statement ok
